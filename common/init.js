@@ -262,10 +262,9 @@ function InitActual() {
         }).then(([categories, accounts]) => {
             let account = accounts.find(acc => acc.name === ACTUAL_DEFAULT_ACCOUNT);
             let category = categories.find(cat => cat.name === ACTUAL_DEFAULT_CATEGORY);
-            if (!account || !category) {
-                logger.error('Could not find default account or category, check your configuration.');
-                process.exit(1);
-            }
+if (!account || !category) {
+    logger.warn('Could not find default account or category, bot will still work but defaults may not apply.');
+}
             logger.info('Successfully connected to Actual Budget.');
         }).catch(error => {
             logger.error('Error connecting to Actual Budget. ', error);
