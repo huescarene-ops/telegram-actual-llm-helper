@@ -95,22 +95,22 @@ Bot.on('message', async (ctx) => {
                         }
 
                         if (parsedResponse.length === 0) {
-                            return ctx.reply('Failed to find any information to create transactions. Try again?', userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
+                            return ctx.reply('No encontré información para crear transacciones. ¿Lo intentamos de nuevo?', userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
                         }
                     } catch (err) {
                         logger.error('Error obtaining/parsing LLM response:', err);
-                        return ctx.reply('Sorry, I received an invalid or empty response from the LLM. Check the bot logs.', userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
+                        return ctx.reply('Lo siento, el agente de IA me envió un mensaje erróneo o vació, dile a René que revise los logs.', userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
                     }
 
                     // CREATE TRANSACTIONS IN ACTUAL
                     try {
                         let replyMessage = '';
                         if (config.BOT_VERBOSITY === VERBOSITY.VERBOSE) {
-                            replyMessage = '*[LLM ANSWER]*\n```\n';
+                            replyMessage = '*[RESPUESTA LLM]*\n```\n';
                             replyMessage += helpers.prettyjson(parsedResponse);
                             replyMessage += '\n```\n\n';
                         }
-                        replyMessage += '*[TRANSACTIONS]*\n';
+                        replyMessage += '*[TRANSACCIONES]*\n';
                         let txInfo = {};
                         const transactions = await Promise.all(parsedResponse.map(async (tx) => {
                             if (!tx.account) {
@@ -203,9 +203,9 @@ Bot.on('message', async (ctx) => {
 
                         replyMessage += '\n*[ACTUAL]*\n';
                         if (!added) {
-                            replyMessage += 'no changes';
+                            replyMessage += 'sin cambios';
                         } else {
-                            replyMessage += `added: ${added}`;
+                            replyMessage += `agregadas: ${added}`;
                             await Actual.sync();
                         }
                         logger.info(`Added ${added} transactions to Actual Budget.`);
@@ -218,9 +218,9 @@ Bot.on('message', async (ctx) => {
                         logger.error('Error creating transactions in Actual Budget:', err);
 
                         if (err.message && err.message.includes('convert currency')) {
-                            return ctx.reply('Sorry, there was an error converting the currency. Check the bot logs.', userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
+                            return ctx.reply('Hubo un error convirtiendo la moneda. Revisa los logs.', userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
                         }
-                        return ctx.reply('Sorry, I encountered an error creating the transaction(s). Check the bot logs.', userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
+                        return ctx.reply('Hubo un error al guardar la(s) transacción(es). Dile a René que revise los logs.', userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
                     }
                 }
             } else {
