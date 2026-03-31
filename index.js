@@ -1,277 +1,184 @@
-const {
-    VERBOSITY, INPUT_API_USER,
-    logger, config, helpers,
-    convertCurrency,
-    InitApp, InitActual, InitBot, LaunchBot
-} = require('./common/init');
-const OpenAI = require('openai');
+require('dotenv').config();
+const fs = require('fs');
+const winston = require('winston');
+const { Telegraf } = require('telegraf')
+const ActualManager = require('./actualManager');
+const express = require('express');
+const axios = require('axios');
+const helpers = require('./helpers');
 
-logger.info('Bot is starting up...');
+const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
+const logger = winston.createLogger({
+    level: LOG_LEVEL,
+    format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+        winston.format.align(),
+        winston.format.printf(({ timestamp, level, message }) => '[' + timestamp + '] [' + level + ']: ' + message)
+    ),
+    transports: [ new winston.transports.Console() ]
+});
 
-// -- Initialize ---
-let App = InitApp();
-let Actual = InitActual();
-let Bot = InitBot();
+console.log = (...args) => logger.debug(args.join(' '));
+console.info = (...args) => logger.info(args.join(' '));
+console.warn = (...args) => logger.warn(args.join(' '));
+console.error = (...args) => logger.error(args.join(' '));
+console.debug = (...args) => logger.debug(args.join(' '));
 
-// -- Start Server --
-App.listen(config.PORT, () => {
-    logger.info(`Successfully started server on port ${config.PORT}.`);
-}).on('error', (err) => {
-    logger.error(`Failed to start server. ${err}`);
+const BOT_TOKEN = process.env.BOT_TOKEN;
+if (!BOT_TOKEN) { logger.error('Falta BOT_TOKEN.'); process.exit(1); }
+
+const USER_IDS = process.env.USER_IDS ? process.env.USER_IDS.split(',').map(id => parseInt(id.trim(), 10)) : [];
+if (!USER_IDS.length) { logger.error('Falta USER_IDS.'); process.exit(1); }
+
+const ACTUAL_USER_RENE = parseInt(process.env.ACTUAL_USER_RENE, 10) || 0;
+const ACTUAL_USER_DANI = parseInt(process.env.ACTUAL_USER_DANI, 10) || 0;
+const INPUT_API_KEY = process.env.INPUT_API_KEY || '';
+const USE_POLLING = process.env.USE_POLLING === 'true';
+const INPUT_API_USER = 'InputAPIUser';
+
+const VERBOSITY = { SILENT: 0, MINIMAL: 1, NORMAL: 2, VERBOSE: 3 };
+const BOT_VERBOSITY = VERBOSITY[process.env.BOT_VERBOSITY?.toUpperCase()] ?? VERBOSITY.NORMAL;
+
+let BASE_URL = '';
+if (!USE_POLLING) {
+    try {
+        BASE_URL = helpers.validateAndTrimUrl(process.env.BASE_URL);
+    } catch (error) {
+        logger.error('BASE_URL inválida. Usa USE_POLLING=true o proporciona una URL válida.');
+        process.exit(1);
+    }
+}
+
+const PORT = parseInt(process.env.PORT, 10) || 5007;
+
+const INTRO_DEFAULT = 'Este es un bot privado para registrar transacciones en Actual Budget.\n\nTu User ID es %USER_ID%.';
+const INTRO = '¡Hola! Envíame información sobre una transacción y la procesaré.\n\nComandos:\n/balance - Ver balance compartido\n/liquidar - Resetear el balance\n\nPara gastos compartidos agrega @split:\n  Tacos 400 @split';
+
+const ACTUAL_API_ENDPOINT = process.env.ACTUAL_API_ENDPOINT;
+const ACTUAL_PASSWORD = process.env.ACTUAL_PASSWORD;
+const ACTUAL_SYNC_ID = process.env.ACTUAL_SYNC_ID;
+const ACTUAL_SYNC_ID_2 = process.env.ACTUAL_SYNC_ID_2 || '';
+const ACTUAL_DATA_DIR = process.env.ACTUAL_DATA_DIR || '/app/data';
+const ACTUAL_CURRENCY = process.env.ACTUAL_CURRENCY || 'MXN';
+const ACTUAL_DEFAULT_ACCOUNT = process.env.ACTUAL_DEFAULT_ACCOUNT || 'Efectivo';
+const ACTUAL_DEFAULT_ACCOUNT_DANI = process.env.ACTUAL_DEFAULT_ACCOUNT_DANI || 'Efectivo';
+const ACTUAL_DEFAULT_CATEGORY = process.env.ACTUAL_DEFAULT_CATEGORY || 'Estilo de Vida';
+const ACTUAL_NOTE_PREFIX = process.env.ACTUAL_NOTE_PREFIX || '🤖';
+const ACTUAL_BALANCE_ACCOUNT = process.env.ACTUAL_BALANCE_ACCOUNT || 'Balance René-Dani';
+
+if (!ACTUAL_API_ENDPOINT || !ACTUAL_PASSWORD || !ACTUAL_SYNC_ID) {
+    logger.error('Falta configuración de Actual API. Saliendo...');
     process.exit(1);
-});
+}
 
-// -- Start Bot --
-LaunchBot(Bot);
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_API_ENDPOINT = process.env.OPENAI_API_ENDPOINT || 'https://api.openai.com/v1';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const OPENAI_TEMPERATURE = parseFloat(process.env.OPENAI_TEMPERATURE) || 0.2;
 
-// -- Unified Message Handler --
-Bot.on('message', async (ctx) => {
-    const userId = ctx.from?.id;
-    const chatType = ctx.chat?.type;
-    const messageText = ctx.message.text || ctx.message.caption;
-    const userName = ctx.from?.first_name;
-    logger.warn(userName);
+if (!OPENAI_API_KEY) { logger.error('Falta OPENAI_API_KEY.'); process.exit(1); }
 
-    logger.info(`Incoming message from user: ${userId}, chat type: ${chatType}`);
-
-    if (messageText) {
-        const trimmedText = messageText.trim();
-
-        // Handle /start or /help command
-        if (chatType === 'private') {
-            if (config.USER_IDS.includes(userId)) {
-                if (trimmedText == '/start' || trimmedText == '/help') {
-                    logger.debug(`Sending intro message to user ${userId}.`);
-                    return ctx.reply(config.INTRO.replace('%USER_ID%', userId));
-                } else {
-                    await Actual.sync();
-                    const categories = await Actual.getCategories();
-                    const accounts = await Actual.getAccounts();
-                    const payees = await Actual.getPayees();
-
-                    const prompt = config.OPENAI_PROMPT
-                        .replace('%DATE%', new Date().toISOString().split('T')[0])
-                        .replace('%DEFAULT_ACCOUNT%', config.ACTUAL_DEFAULT_ACCOUNT)
-                        .replace('%DEFAULT_CATEGORY%', config.ACTUAL_DEFAULT_CATEGORY)
-                        .replace('%CURRENCY%', config.ACTUAL_CURRENCY)
-                        .replace('%ACCOUNTS_LIST%', accounts.map(acc => acc.name).join(', '))
-                        .replace('%CATEGORY_LIST%', categories.map(cat => cat.name).join(', '))
-                        .replace('%PAYEE_LIST%', payees.map(payee => payee.name).join(', '))
-                        .replace('%RULES%', config.OPENAI_RULES.join('\n'));
-
-                    // CALL THE LLM AND PARSE ITS RESPONSE
-                    let parsedResponse = null;
-                    try {
-                        const openai = new OpenAI({
-                            apiKey: config.OPENAI_API_KEY,
-                            baseURL: config.OPENAI_API_ENDPOINT,
-                        });
-
-                        logger.debug('=== LLM Request Details ===');
-                        logger.debug('System Prompt:\n' + prompt);
-                        logger.debug(`User Message: ${trimmedText}`);
-
-                        const response = await openai.chat.completions.create({
-                            model: config.OPENAI_MODEL,
-                            messages: [
-                                { role: 'system', content: prompt },
-                                { role: 'user', content: trimmedText },
-                            ],
-                            temperature: config.OPENAI_TEMPERATURE,
-                        });
-
-                        // Remove possible Markdown fences
-                        const jsonResponse = response.choices[0].message.content
-                            .replace(/```(?:json)?\n?|\n?```/g, '')
-                            .trim();
-
-                        logger.debug('=== LLM Response ===');
-                        logger.debug(jsonResponse);
-
-                        parsedResponse = JSON.parse(jsonResponse);
-
-                        if (!Array.isArray(parsedResponse)) {
-                            throw new Error('LLM response is not an array');
-                        }
-
-                        if (parsedResponse.length === 0) {
-                            return ctx.reply('No encontré información para crear transacciones. ¿Lo intentamos de nuevo?', userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
-                        }
-                    } catch (err) {
-                        logger.error('Error obtaining/parsing LLM response:', err);
-                        return ctx.reply('Lo siento, el agente de IA me envió un mensaje erróneo o vació, dile a René que revise los logs.', userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
-                    }
-
-                    // CREATE TRANSACTIONS IN ACTUAL
-                    try {
-                        let replyMessage = '';
-                        if (config.BOT_VERBOSITY === VERBOSITY.VERBOSE) {
-                            replyMessage = '*[RESPUESTA LLM]*\n```\n';
-                            replyMessage += helpers.prettyjson(parsedResponse);
-                            replyMessage += '\n```\n\n';
-                        }
-                        replyMessage += '*[TRANSACCIONES]*\n';
-                        let txInfo = {};
-                        const transactions = await Promise.all(parsedResponse.map(async (tx) => {
-                            if (!tx.account) {
-                                tx.account = config.ACTUAL_DEFAULT_ACCOUNT;
-                            }
-                            if (!tx.category) {
-                                tx.category = config.ACTUAL_DEFAULT_CATEGORY;
-                            }
-                            const account = accounts.find(acc => acc.name === tx.account);
-                            const category = categories.find(cat => cat.name === tx.category);
-                            const payee = payees.find(p => p.name === tx.payee);
-
-                            if (!account) {
-                                throw new Error(`Invalid account specified: "${tx.account}"`);
-                            }
-                            if (!category) {
-                                throw new Error(`Invalid category specified: "${tx.category}"`);
-                            }
-
-                            let date = tx.date || new Date().toISOString().split('T')[0];
-                            let apiDate = date;
-                            let amount = tx.amount;
-
-                            // If date is today, currency API may not have today's data yet due to timezone differences
-                            if (date === new Date().toISOString().split('T')[0]) {
-                                apiDate = 'latest';
-                            }
-
-                            if (tx.currency && tx.currency.toLowerCase() !== config.ACTUAL_CURRENCY.toLowerCase()) {
-                                amount = await convertCurrency(tx.amount, tx.currency, config.ACTUAL_CURRENCY, apiDate, tx.exchange_rate);
-                            } else {
-                                tx.currency = config.ACTUAL_CURRENCY;
-                            }
-
-                            // Provide human-readable output of processed transaction data
-                            replyMessage += '```\n';
-                            let humanAmount = `${tx.amount} ${tx.currency}`;
-                            if (tx.currency && tx.currency.toLowerCase() !== config.ACTUAL_CURRENCY.toLowerCase()) {
-                                humanAmount = `${amount} ${config.ACTUAL_CURRENCY}`;
-                            }
-
-                            txInfo = {
-                                date,
-                                account: account.name,
-                                category: category.name,
-                                ...(humanAmount && { amount: humanAmount }),
-                                ...(tx.payee && { payee: tx.payee }),
-                                ...(tx.notes && { notes: tx.notes })
-                            };
-                            if (config.BOT_VERBOSITY >= VERBOSITY.NORMAL) {
-                                replyMessage += helpers.prettyjson(txInfo);
-                                replyMessage += '```\n';
-                            } else {
-                                replyMessage = '';
-                            }
-
-                            amount = parseFloat((amount * 100).toFixed(2)); // Convert to cents
-                            return {
-                                account: account.id,
-                                date,
-                                amount,
-                                payee_name: tx.payee || null,
-                                category: category.id,
-                                notes: `${config.ACTUAL_NOTE_PREFIX} ${tx.notes || ''}`,
-                            };
-                        }));
-
-                        // Group transactions by account
-                        const transactionsByAccount = transactions.reduce((acc, tx) => {
-                            if (!acc[tx.account]) {
-                                acc[tx.account] = [];
-                            }
-                            acc[tx.account].push(tx);
-                            return acc;
-                        }, {});
-
-                        let added = 0;
-
-                        for (const [accountId, accountTxs] of Object.entries(transactionsByAccount)) {
-                            const transactionsText = accountTxs.map(tx =>
-                                `Account: ${tx.account}, Date: ${tx.date}, Amount: ${tx.amount}, Payee: ${tx.payee_name}, Category: ${tx.category}, Notes: ${tx.notes}`
-                            ).join('\n');
-                            logger.info(`Importing transactions for account ${accountId}:\n${transactionsText}`);
-
-                            const result = await Actual.addTransactions(accountId, accountTxs);
-                            if (result) {
-                                added += accountTxs.length;
-                            }
-                        }
-
-                        replyMessage += '\n*[ACTUAL]*\n';
-                        if (!added) {
-                            replyMessage += 'sin cambios';
-                        } else {
-                            replyMessage += `agregadas: ${added}`;
-                            await Actual.sync();
-                        }
-                        logger.info(`Added ${added} transactions to Actual Budget.`);
-
-                        if (config.BOT_VERBOSITY > VERBOSITY.SILENT) {
-                            return ctx.reply(replyMessage, { parse_mode: 'Markdown', ...(userName !== INPUT_API_USER && { reply_to_message_id: ctx.message.message_id }) });
-                        }
-
-                    } catch (err) {
-                        logger.error('Error creating transactions in Actual Budget:', err);
-
-                        if (err.message && err.message.includes('convert currency')) {
-                            return ctx.reply('Hubo un error convirtiendo la moneda. Revisa los logs.', userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
-                        }
-                        return ctx.reply('Hubo un error al guardar la(s) transacción(es). Dile a René que revise los logs.', userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
-                    }
-                }
-            } else {
-                return ctx.reply(INTRO_DEFAULT, userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
-            }
-        }
+let OPENAI_PROMPT_PATH = './ruleset/default.prompt';
+try {
+    const customPromptPath = './ruleset/custom.prompt';
+    if (fs.existsSync(customPromptPath) && fs.statSync(customPromptPath).size > 0) {
+        OPENAI_PROMPT_PATH = customPromptPath;
     }
-});
+} catch (error) { logger.error('Error al verificar prompt personalizado:', error); process.exit(1); }
 
-// Webhook endpoint for Telegram
-App.post('/webhook', (req, res) => {
+let OPENAI_PROMPT = '';
+try {
+    OPENAI_PROMPT = fs.readFileSync(OPENAI_PROMPT_PATH, 'utf8').trim();
+} catch (err) { logger.error('Error al cargar prompt:', err); process.exit(1); }
+
+let OPENAI_RULES_PATH = './ruleset/default.rules';
+try {
+    const customRulesPath = './ruleset/custom.rules';
+    if (fs.existsSync(customRulesPath) && fs.statSync(customRulesPath).size > 0) {
+        OPENAI_RULES_PATH = customRulesPath;
+    }
+} catch (error) { logger.error('Error al verificar reglas personalizadas:', error); process.exit(1); }
+
+let OPENAI_RULES = [];
+try {
+    OPENAI_RULES = fs.readFileSync(OPENAI_RULES_PATH, 'utf8')
+        .split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+} catch (err) { logger.error('Error al cargar reglas:', err); process.exit(1); }
+
+const envSettings = {
+    GENERAL: { BOT_TOKEN: helpers.obfuscate(BOT_TOKEN), USE_POLLING, PORT, LOG_LEVEL: LOG_LEVEL.toUpperCase(), USER_IDS, ACTUAL_USER_RENE, ACTUAL_USER_DANI, BOT_VERBOSITY: Object.keys(VERBOSITY).find(k => VERBOSITY[k] === BOT_VERBOSITY) },
+    OPEN_AI: { OPENAI_API_KEY: helpers.obfuscate(OPENAI_API_KEY), OPENAI_API_ENDPOINT, OPENAI_MODEL, OPENAI_TEMPERATURE, OPENAI_PROMPT_PATH, OPENAI_RULES_PATH },
+    ACTUAL: { ACTUAL_API_ENDPOINT, ACTUAL_PASSWORD: helpers.obfuscate(ACTUAL_PASSWORD), ACTUAL_SYNC_ID, ACTUAL_SYNC_ID_2: ACTUAL_SYNC_ID_2 ? helpers.obfuscate(ACTUAL_SYNC_ID_2) : '(no configurado)', ACTUAL_CURRENCY, ACTUAL_DEFAULT_ACCOUNT, ACTUAL_DEFAULT_ACCOUNT_DANI, ACTUAL_DEFAULT_CATEGORY, ACTUAL_DATA_DIR, ACTUAL_NOTE_PREFIX, ACTUAL_BALANCE_ACCOUNT }
+};
+logger.info('=== Configuración de inicio ===\n' + helpers.prettyjson(envSettings));
+
+if (INPUT_API_KEY.length < 16) {
+    logger.warn('INPUT_API_KEY debe tener al menos 16 caracteres. El endpoint /input estará deshabilitado.');
+}
+
+function InitActualManager() {
+    const budgets = { rene: { syncId: ACTUAL_SYNC_ID, dataDir: ACTUAL_DATA_DIR } };
+    if (ACTUAL_SYNC_ID_2) {
+        budgets.dani = { syncId: ACTUAL_SYNC_ID_2, dataDir: ACTUAL_DATA_DIR + '_dani' };
+        logger.info('Modo dual budget activado (René + Dani).');
+    } else {
+        logger.warn('ACTUAL_SYNC_ID_2 no configurado. Solo se usará el budget de René.');
+    }
+    return new ActualManager({ serverURL: ACTUAL_API_ENDPOINT, password: ACTUAL_PASSWORD, budgets });
+}
+
+function InitApp() {
+    const App = express();
+    App.use(express.json());
+    return App;
+}
+
+function InitBot() {
     try {
-        Bot.handleUpdate(req.body);
-        res.sendStatus(200);
+        const Bot = new Telegraf(BOT_TOKEN);
+        Bot.catch((err, ctx) => { logger.error('Error global de Telegraf:', err); });
+        return Bot;
     } catch (error) {
-        logger.error('Error handling update:', error);
-        res.sendStatus(500);
+        logger.error('Error al inicializar Telegraf: ' + error.message);
+        process.exit(1);
     }
-});
+}
 
-// API endpoint for custom input outside Telegram
-App.post('/input', (req, res) => {
-    const userAgent = req.headers['user-agent'];
-    const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.ip || req.socket.remoteAddress;
-    logger.debug(`Custom input request received [IP: ${ip}, User-Agent: ${userAgent}]`);
+async function LaunchBot(Bot) {
+    if (USE_POLLING) {
+        try { await Bot.telegram.deleteWebhook({ drop_pending_updates: true }); } catch (err) { logger.warn('deleteWebhook falló: ' + err); }
+        try { Bot.launch(); logger.debug('Polling activado.'); } catch (err) { logger.error('Error al iniciar polling:', err); process.exit(1); }
+    } else {
+        try { await Bot.telegram.setWebhook(BASE_URL + '/webhook'); logger.debug('Webhook configurado.'); } catch (err) { logger.error('Error al configurar webhook:', err); process.exit(1); }
+    }
+    logger.info('Conectado a Telegram correctamente.');
+}
+
+process.on('unhandledRejection', (reason, promise) => { logger.error('Rechazo no manejado:', reason); process.exit(1); });
+process.on('uncaughtException', (err) => { logger.error('Excepción no capturada:', err); process.exit(1); });
+
+async function convertCurrency(amount, fromCurrency, toCurrency, apiDate, rate = undefined) {
+    if (fromCurrency.toLowerCase() === toCurrency.toLowerCase()) return parseFloat(amount.toFixed(2));
+    if (rate !== undefined) return parseFloat((amount * rate).toFixed(2));
+    const apiUrl = 'https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@' + apiDate + '/v1/currencies/' + fromCurrency.toLowerCase() + '.json';
     try {
-        const apiKey = req.headers['x-api-key'];
-
-        if (!apiKey || apiKey !== config.INPUT_API_KEY || !config.INPUT_API_KEY || config.INPUT_API_KEY.length < 16) {
-            logger.debug('Custom input request denied: invalid API key');
-            return res.status(401).send('Unauthorized');
-        }
-
-        const { user_id, text } = req.body;
-
-        if (config.USER_IDS.includes(user_id)) {
-            Bot.handleUpdate(helpers.createUpdateObject(user_id, INPUT_API_USER, text));
-            logger.debug('Custom input request handled successfully.');
-            return res.json({ status: 'OK' });
-        } else {
-            logger.debug('Custom input request denied: invalid user ID');
-            return res.status(403).send('Forbidden');
-        }
-
+        const response = await axios.get(apiUrl);
+        const rates = response.data[fromCurrency.toLowerCase()];
+        if (!rates || !rates[toCurrency.toLowerCase()]) throw new Error('Tasa no encontrada para ' + fromCurrency + ' a ' + toCurrency);
+        return parseFloat((amount * rates[toCurrency.toLowerCase()]).toFixed(2));
     } catch (error) {
-        logger.error('Error handling custom input request. ', error);
-        return res.status(500).json({ error: 'Failed to handle message' });
+        logger.error('Error al convertir moneda:', error);
+        throw new Error('No se pudo convertir la moneda');
     }
-});
+}
 
-// Health check endpoint
-App.get('/health', (req, res) => {
-    res.send('OK');
-});
+module.exports = {
+    InitApp, InitBot, LaunchBot, InitActualManager, convertCurrency, helpers, logger, VERBOSITY, INPUT_API_USER,
+    config: {
+        LOG_LEVEL, PORT, USER_IDS, BOT_VERBOSITY, INPUT_API_KEY, INTRO_DEFAULT, INTRO,
+        ACTUAL_CURRENCY, ACTUAL_DEFAULT_ACCOUNT, ACTUAL_DEFAULT_ACCOUNT_DANI, ACTUAL_DEFAULT_CATEGORY,
+        ACTUAL_NOTE_PREFIX, ACTUAL_BALANCE_ACCOUNT, ACTUAL_USER_RENE, ACTUAL_USER_DANI, ACTUAL_SYNC_ID_2,
+        OPENAI_API_KEY, OPENAI_API_ENDPOINT, OPENAI_MODEL, OPENAI_TEMPERATURE, OPENAI_PROMPT, OPENAI_RULES
+    },
+};
