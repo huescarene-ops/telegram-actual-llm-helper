@@ -1,184 +1,327 @@
-require('dotenv').config();
-const fs = require('fs');
-const winston = require('winston');
-const { Telegraf } = require('telegraf')
-const ActualManager = require('./actualManager');
-const express = require('express');
-const axios = require('axios');
-const helpers = require('./helpers');
+const {
+    VERBOSITY, INPUT_API_USER,
+    logger, config, helpers,
+    convertCurrency,
+    InitApp, InitActualManager, InitBot, LaunchBot
+} = require('./common/init');
+const OpenAI = require('openai');
 
-const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
-const logger = winston.createLogger({
-    level: LOG_LEVEL,
-    format: winston.format.combine(
-        winston.format.colorize(),
-        winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
-        winston.format.align(),
-        winston.format.printf(({ timestamp, level, message }) => '[' + timestamp + '] [' + level + ']: ' + message)
-    ),
-    transports: [ new winston.transports.Console() ]
+logger.info('El bot está iniciando...');
+
+// -- Initialize ---
+let App = InitApp();
+let ActualMgr = InitActualManager();
+let Bot = InitBot();
+
+// -- Start Server --
+App.listen(config.PORT, () => {
+    logger.info('Servidor iniciado correctamente en el puerto ' + config.PORT + '.');
+}).on('error', (err) => {
+    logger.error('Error al iniciar el servidor. ' + err);
+    process.exit(1);
 });
 
-console.log = (...args) => logger.debug(args.join(' '));
-console.info = (...args) => logger.info(args.join(' '));
-console.warn = (...args) => logger.warn(args.join(' '));
-console.error = (...args) => logger.error(args.join(' '));
-console.debug = (...args) => logger.debug(args.join(' '));
+// -- Start Bot --
+LaunchBot(Bot);
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
-if (!BOT_TOKEN) { logger.error('Falta BOT_TOKEN.'); process.exit(1); }
+// -- Helper: determine budget key from user ID --
+function getBudgetKey(userId) {
+    if (userId === config.ACTUAL_USER_RENE) return 'rene';
+    if (userId === config.ACTUAL_USER_DANI) return 'dani';
+    return 'rene';
+}
 
-const USER_IDS = process.env.USER_IDS ? process.env.USER_IDS.split(',').map(id => parseInt(id.trim(), 10)) : [];
-if (!USER_IDS.length) { logger.error('Falta USER_IDS.'); process.exit(1); }
+// -- Helper: get default account for a user --
+function getDefaultAccount(userId) {
+    if (userId === config.ACTUAL_USER_DANI) return config.ACTUAL_DEFAULT_ACCOUNT_DANI;
+    return config.ACTUAL_DEFAULT_ACCOUNT;
+}
 
-const ACTUAL_USER_RENE = parseInt(process.env.ACTUAL_USER_RENE, 10) || 0;
-const ACTUAL_USER_DANI = parseInt(process.env.ACTUAL_USER_DANI, 10) || 0;
-const INPUT_API_KEY = process.env.INPUT_API_KEY || '';
-const USE_POLLING = process.env.USE_POLLING === 'true';
-const INPUT_API_USER = 'InputAPIUser';
+// -- Helper: build LLM prompt with budget data --
+async function buildPrompt(userId) {
+    const budgetKey = getBudgetKey(userId);
+    const defaultAccount = getDefaultAccount(userId);
+    const { accounts, categories, payees } = await ActualMgr.getBudgetData(budgetKey);
 
-const VERBOSITY = { SILENT: 0, MINIMAL: 1, NORMAL: 2, VERBOSE: 3 };
-const BOT_VERBOSITY = VERBOSITY[process.env.BOT_VERBOSITY?.toUpperCase()] ?? VERBOSITY.NORMAL;
+    return config.OPENAI_PROMPT
+        .replace('%DATE%', new Date().toISOString().split('T')[0])
+        .replace('%DEFAULT_ACCOUNT%', defaultAccount)
+        .replace('%DEFAULT_CATEGORY%', config.ACTUAL_DEFAULT_CATEGORY)
+        .replace('%CURRENCY%', config.ACTUAL_CURRENCY)
+        .replace('%ACCOUNTS_LIST%', accounts.map(acc => acc.name).join(', '))
+        .replace('%CATEGORY_LIST%', categories.map(cat => cat.name).join(', '))
+        .replace('%PAYEE_LIST%', payees.map(payee => payee.name).join(', '))
+        .replace('%RULES%', config.OPENAI_RULES.join('\n'));
+}
 
-let BASE_URL = '';
-if (!USE_POLLING) {
+// -- Helper: call LLM and parse response --
+async function callLLM(prompt, userMessage) {
+    const openai = new OpenAI({
+        apiKey: config.OPENAI_API_KEY,
+        baseURL: config.OPENAI_API_ENDPOINT,
+    });
+
+    logger.debug('=== Solicitud al LLM ===');
+    logger.debug('Prompt:\n' + prompt);
+    logger.debug('Mensaje: ' + userMessage);
+
+    const response = await openai.chat.completions.create({
+        model: config.OPENAI_MODEL,
+        messages: [
+            { role: 'system', content: prompt },
+            { role: 'user', content: userMessage },
+        ],
+        temperature: config.OPENAI_TEMPERATURE,
+    });
+
+    const jsonResponse = response.choices[0].message.content
+        .replace(/```(?:json)?\n?|\n?```/g, '')
+        .trim();
+
+    logger.debug('=== Respuesta LLM ===');
+    logger.debug(jsonResponse);
+
+    const parsed = JSON.parse(jsonResponse);
+    if (!Array.isArray(parsed)) throw new Error('La respuesta del LLM no es un array');
+    return parsed;
+}
+
+// -- Helper: format balance message --
+function formatBalance(balance) {
+    const abs = Math.abs(balance).toFixed(2);
+    if (balance > 0) return 'Dani le debe a René $' + abs + ' MXN';
+    if (balance < 0) return 'René le debe a Dani $' + abs + ' MXN';
+    return 'Están a mano, balance en cero 🎉';
+}
+
+// -- Unified Message Handler --
+Bot.on('message', async (ctx) => {
+    const userId = ctx.from?.id;
+    const chatType = ctx.chat?.type;
+    const messageText = ctx.message.text || ctx.message.caption;
+    const userName = ctx.from?.first_name;
+    logger.warn(userName);
+
+    logger.info('Mensaje entrante del usuario: ' + userId + ', tipo de chat: ' + chatType);
+
+    if (!messageText) return;
+    if (chatType !== 'private') return;
+
+    if (!config.USER_IDS.includes(userId)) {
+        return ctx.reply(config.INTRO_DEFAULT.replace('%USER_ID%', userId));
+    }
+
+    const trimmedText = messageText.trim();
+
+    // /start or /help
+    if (trimmedText === '/start' || trimmedText === '/help') {
+        logger.debug('Enviando intro al usuario ' + userId);
+        return ctx.reply(config.INTRO.replace('%USER_ID%', userId));
+    }
+
+    // /balance
+    if (trimmedText === '/balance') {
+        try {
+            const balance = await ActualMgr.getBalance(config.ACTUAL_BALANCE_ACCOUNT);
+            const msg = '💰 *Balance compartido*\n' + formatBalance(balance);
+            await ctx.reply(msg, { parse_mode: 'Markdown' });
+            const otherId = userId === config.ACTUAL_USER_RENE ? config.ACTUAL_USER_DANI : config.ACTUAL_USER_RENE;
+            if (otherId) {
+                try { await Bot.telegram.sendMessage(otherId, msg, { parse_mode: 'Markdown' }); }
+                catch (e) { logger.warn('No se pudo notificar al otro usuario: ' + e.message); }
+            }
+        } catch (err) {
+            logger.error('Error al obtener balance:', err);
+            await ctx.reply('Hubo un error al obtener el balance. Revisa los logs.');
+        }
+        return;
+    }
+
+    // /liquidar
+    if (trimmedText === '/liquidar') {
+        try {
+            const previous = await ActualMgr.resetBalance(config.ACTUAL_BALANCE_ACCOUNT);
+            const msg = previous === 0
+                ? '✅ El balance ya estaba en cero.'
+                : '✅ Balance liquidado. Se resetó desde: ' + formatBalance(previous);
+            await ctx.reply(msg);
+            const otherId = userId === config.ACTUAL_USER_RENE ? config.ACTUAL_USER_DANI : config.ACTUAL_USER_RENE;
+            if (otherId) {
+                try { await Bot.telegram.sendMessage(otherId, msg); }
+                catch (e) { logger.warn('No se pudo notificar al otro usuario: ' + e.message); }
+            }
+        } catch (err) {
+            logger.error('Error al liquidar balance:', err);
+            await ctx.reply('Hubo un error al liquidar el balance. Revisa los logs.');
+        }
+        return;
+    }
+
+    // Transaction processing
+    const isSplit = trimmedText.toLowerCase().includes('@split');
+    const cleanText = trimmedText.replace(/@split/gi, '').trim();
+    const budgetKey = getBudgetKey(userId);
+
+    // Call LLM
+    let parsedResponse;
     try {
-        BASE_URL = helpers.validateAndTrimUrl(process.env.BASE_URL);
-    } catch (error) {
-        logger.error('BASE_URL inválida. Usa USE_POLLING=true o proporciona una URL válida.');
-        process.exit(1);
+        const prompt = await buildPrompt(userId);
+        parsedResponse = await callLLM(prompt, cleanText);
+        if (parsedResponse.length === 0) {
+            return ctx.reply('No encontré información para crear transacciones. ¿Puedes intentar de nuevo?',
+                userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
+        }
+    } catch (err) {
+        logger.error('Error al obtener/parsear respuesta del LLM:', err);
+        return ctx.reply('Hubo un error procesando tu mensaje. Intenta de nuevo.',
+            userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
     }
-}
 
-const PORT = parseInt(process.env.PORT, 10) || 5007;
-
-const INTRO_DEFAULT = 'Este es un bot privado para registrar transacciones en Actual Budget.\n\nTu User ID es %USER_ID%.';
-const INTRO = '¡Hola! Envíame información sobre una transacción y la procesaré.\n\nComandos:\n/balance - Ver balance compartido\n/liquidar - Resetear el balance\n\nPara gastos compartidos agrega @split:\n  Tacos 400 @split';
-
-const ACTUAL_API_ENDPOINT = process.env.ACTUAL_API_ENDPOINT;
-const ACTUAL_PASSWORD = process.env.ACTUAL_PASSWORD;
-const ACTUAL_SYNC_ID = process.env.ACTUAL_SYNC_ID;
-const ACTUAL_SYNC_ID_2 = process.env.ACTUAL_SYNC_ID_2 || '';
-const ACTUAL_DATA_DIR = process.env.ACTUAL_DATA_DIR || '/app/data';
-const ACTUAL_CURRENCY = process.env.ACTUAL_CURRENCY || 'MXN';
-const ACTUAL_DEFAULT_ACCOUNT = process.env.ACTUAL_DEFAULT_ACCOUNT || 'Efectivo';
-const ACTUAL_DEFAULT_ACCOUNT_DANI = process.env.ACTUAL_DEFAULT_ACCOUNT_DANI || 'Efectivo';
-const ACTUAL_DEFAULT_CATEGORY = process.env.ACTUAL_DEFAULT_CATEGORY || 'Estilo de Vida';
-const ACTUAL_NOTE_PREFIX = process.env.ACTUAL_NOTE_PREFIX || '🤖';
-const ACTUAL_BALANCE_ACCOUNT = process.env.ACTUAL_BALANCE_ACCOUNT || 'Balance René-Dani';
-
-if (!ACTUAL_API_ENDPOINT || !ACTUAL_PASSWORD || !ACTUAL_SYNC_ID) {
-    logger.error('Falta configuración de Actual API. Saliendo...');
-    process.exit(1);
-}
-
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_API_ENDPOINT = process.env.OPENAI_API_ENDPOINT || 'https://api.openai.com/v1';
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-const OPENAI_TEMPERATURE = parseFloat(process.env.OPENAI_TEMPERATURE) || 0.2;
-
-if (!OPENAI_API_KEY) { logger.error('Falta OPENAI_API_KEY.'); process.exit(1); }
-
-let OPENAI_PROMPT_PATH = './ruleset/default.prompt';
-try {
-    const customPromptPath = './ruleset/custom.prompt';
-    if (fs.existsSync(customPromptPath) && fs.statSync(customPromptPath).size > 0) {
-        OPENAI_PROMPT_PATH = customPromptPath;
-    }
-} catch (error) { logger.error('Error al verificar prompt personalizado:', error); process.exit(1); }
-
-let OPENAI_PROMPT = '';
-try {
-    OPENAI_PROMPT = fs.readFileSync(OPENAI_PROMPT_PATH, 'utf8').trim();
-} catch (err) { logger.error('Error al cargar prompt:', err); process.exit(1); }
-
-let OPENAI_RULES_PATH = './ruleset/default.rules';
-try {
-    const customRulesPath = './ruleset/custom.rules';
-    if (fs.existsSync(customRulesPath) && fs.statSync(customRulesPath).size > 0) {
-        OPENAI_RULES_PATH = customRulesPath;
-    }
-} catch (error) { logger.error('Error al verificar reglas personalizadas:', error); process.exit(1); }
-
-let OPENAI_RULES = [];
-try {
-    OPENAI_RULES = fs.readFileSync(OPENAI_RULES_PATH, 'utf8')
-        .split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
-} catch (err) { logger.error('Error al cargar reglas:', err); process.exit(1); }
-
-const envSettings = {
-    GENERAL: { BOT_TOKEN: helpers.obfuscate(BOT_TOKEN), USE_POLLING, PORT, LOG_LEVEL: LOG_LEVEL.toUpperCase(), USER_IDS, ACTUAL_USER_RENE, ACTUAL_USER_DANI, BOT_VERBOSITY: Object.keys(VERBOSITY).find(k => VERBOSITY[k] === BOT_VERBOSITY) },
-    OPEN_AI: { OPENAI_API_KEY: helpers.obfuscate(OPENAI_API_KEY), OPENAI_API_ENDPOINT, OPENAI_MODEL, OPENAI_TEMPERATURE, OPENAI_PROMPT_PATH, OPENAI_RULES_PATH },
-    ACTUAL: { ACTUAL_API_ENDPOINT, ACTUAL_PASSWORD: helpers.obfuscate(ACTUAL_PASSWORD), ACTUAL_SYNC_ID, ACTUAL_SYNC_ID_2: ACTUAL_SYNC_ID_2 ? helpers.obfuscate(ACTUAL_SYNC_ID_2) : '(no configurado)', ACTUAL_CURRENCY, ACTUAL_DEFAULT_ACCOUNT, ACTUAL_DEFAULT_ACCOUNT_DANI, ACTUAL_DEFAULT_CATEGORY, ACTUAL_DATA_DIR, ACTUAL_NOTE_PREFIX, ACTUAL_BALANCE_ACCOUNT }
-};
-logger.info('=== Configuración de inicio ===\n' + helpers.prettyjson(envSettings));
-
-if (INPUT_API_KEY.length < 16) {
-    logger.warn('INPUT_API_KEY debe tener al menos 16 caracteres. El endpoint /input estará deshabilitado.');
-}
-
-function InitActualManager() {
-    const budgets = { rene: { syncId: ACTUAL_SYNC_ID, dataDir: ACTUAL_DATA_DIR } };
-    if (ACTUAL_SYNC_ID_2) {
-        budgets.dani = { syncId: ACTUAL_SYNC_ID_2, dataDir: ACTUAL_DATA_DIR + '_dani' };
-        logger.info('Modo dual budget activado (René + Dani).');
-    } else {
-        logger.warn('ACTUAL_SYNC_ID_2 no configurado. Solo se usará el budget de René.');
-    }
-    return new ActualManager({ serverURL: ACTUAL_API_ENDPOINT, password: ACTUAL_PASSWORD, budgets });
-}
-
-function InitApp() {
-    const App = express();
-    App.use(express.json());
-    return App;
-}
-
-function InitBot() {
+    // Create transactions
     try {
-        const Bot = new Telegraf(BOT_TOKEN);
-        Bot.catch((err, ctx) => { logger.error('Error global de Telegraf:', err); });
-        return Bot;
-    } catch (error) {
-        logger.error('Error al inicializar Telegraf: ' + error.message);
-        process.exit(1);
+        let replyMessage = '';
+        if (config.BOT_VERBOSITY === VERBOSITY.VERBOSE) {
+            replyMessage = '*[RESPUESTA LLM]*\n```\n' + helpers.prettyjson(parsedResponse) + '\n```\n\n';
+        }
+        replyMessage += '*[TRANSACCIONES]*\n';
+
+        let added = 0;
+
+        for (const tx of parsedResponse) {
+            if (!tx.amount) continue;
+
+            const defaultAccount = getDefaultAccount(userId);
+            const accountName = tx.account || defaultAccount;
+            const categoryName = tx.category || config.ACTUAL_DEFAULT_CATEGORY;
+            const date = tx.date || new Date().toISOString().split('T')[0];
+            const apiDate = date === new Date().toISOString().split('T')[0] ? 'latest' : date;
+
+            let amount = tx.amount;
+            if (tx.currency && tx.currency.toLowerCase() !== config.ACTUAL_CURRENCY.toLowerCase()) {
+                amount = await convertCurrency(tx.amount, tx.currency, config.ACTUAL_CURRENCY, apiDate, tx.exchange_rate);
+            } else {
+                tx.currency = config.ACTUAL_CURRENCY;
+            }
+
+            const notes = (config.ACTUAL_NOTE_PREFIX + ' ' + (tx.notes || tx.payee || '')).trim();
+
+            if (isSplit) {
+                const halfAmount = amount / 2;
+                const daniAccount = config.ACTUAL_DEFAULT_ACCOUNT_DANI;
+
+                await ActualMgr.addTransaction('rene', {
+                    accountName, categoryName, payeeName: tx.payee || null, amount: halfAmount, date, notes,
+                });
+
+                if (config.ACTUAL_SYNC_ID_2) {
+                    await ActualMgr.addTransaction('dani', {
+                        accountName: daniAccount, categoryName, payeeName: tx.payee || null, amount: halfAmount, date, notes,
+                    });
+                }
+
+                // Balance: positive = Dani owes René, negative = René owes Dani
+                const balanceDelta = userId === config.ACTUAL_USER_RENE ? halfAmount : -halfAmount;
+                await ActualMgr.updateBalance(balanceDelta, config.ACTUAL_BALANCE_ACCOUNT);
+
+                if (config.BOT_VERBOSITY >= VERBOSITY.NORMAL) {
+                    replyMessage += '```\n' + helpers.prettyjson({
+                        fecha: date,
+                        cuenta_rene: accountName,
+                        cuenta_dani: daniAccount,
+                        categoría: categoryName,
+                        monto_cada_uno: halfAmount.toFixed(2) + ' ' + config.ACTUAL_CURRENCY,
+                        ...(tx.payee && { payee: tx.payee }),
+                    }) + '```\n';
+                }
+                added++;
+            } else {
+                await ActualMgr.addTransaction(budgetKey, {
+                    accountName, categoryName, payeeName: tx.payee || null, amount, date, notes,
+                });
+
+                if (config.BOT_VERBOSITY >= VERBOSITY.NORMAL) {
+                    replyMessage += '```\n' + helpers.prettyjson({
+                        fecha: date,
+                        cuenta: accountName,
+                        categoría: categoryName,
+                        monto: amount + ' ' + config.ACTUAL_CURRENCY,
+                        ...(tx.payee && { payee: tx.payee }),
+                        ...(tx.notes && { notas: tx.notes }),
+                    }) + '```\n';
+                }
+                added++;
+            }
+        }
+
+        replyMessage += '\n*[ACTUAL]*\n';
+        replyMessage += added ? 'agregadas: ' + added : 'sin cambios';
+
+        if (isSplit && added) {
+            try {
+                const balance = await ActualMgr.getBalance(config.ACTUAL_BALANCE_ACCOUNT);
+                replyMessage += '\n\n💰 *Balance actualizado:*\n' + formatBalance(balance);
+
+                const otherId = userId === config.ACTUAL_USER_RENE ? config.ACTUAL_USER_DANI : config.ACTUAL_USER_RENE;
+                if (otherId) {
+                    const otherMsg = '📌 *Gasto compartido registrado por ' + userName + '*\n' + replyMessage;
+                    try { await Bot.telegram.sendMessage(otherId, otherMsg, { parse_mode: 'Markdown' }); }
+                    catch (e) { logger.warn('No se pudo notificar al otro usuario: ' + e.message); }
+                }
+            } catch (e) {
+                logger.warn('No se pudo obtener balance actualizado: ' + e.message);
+            }
+        }
+
+        logger.info(added + ' transacción(es) agregada(s) a Actual Budget.');
+
+        if (config.BOT_VERBOSITY > VERBOSITY.SILENT) {
+            return ctx.reply(replyMessage, {
+                parse_mode: 'Markdown',
+                ...(userName !== INPUT_API_USER && { reply_to_message_id: ctx.message.message_id })
+            });
+        }
+
+    } catch (err) {
+        logger.error('Error al crear transacciones en Actual Budget:', err);
+        if (err.message && err.message.includes('convertir la moneda')) {
+            return ctx.reply('Hubo un error al convertir la moneda. Revisa los logs.',
+                userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
+        }
+        return ctx.reply('Hubo un error al guardar la(s) transacción(es). Revisa los logs.',
+            userName === INPUT_API_USER ? {} : { reply_to_message_id: ctx.message.message_id });
     }
-}
+});
 
-async function LaunchBot(Bot) {
-    if (USE_POLLING) {
-        try { await Bot.telegram.deleteWebhook({ drop_pending_updates: true }); } catch (err) { logger.warn('deleteWebhook falló: ' + err); }
-        try { Bot.launch(); logger.debug('Polling activado.'); } catch (err) { logger.error('Error al iniciar polling:', err); process.exit(1); }
-    } else {
-        try { await Bot.telegram.setWebhook(BASE_URL + '/webhook'); logger.debug('Webhook configurado.'); } catch (err) { logger.error('Error al configurar webhook:', err); process.exit(1); }
-    }
-    logger.info('Conectado a Telegram correctamente.');
-}
-
-process.on('unhandledRejection', (reason, promise) => { logger.error('Rechazo no manejado:', reason); process.exit(1); });
-process.on('uncaughtException', (err) => { logger.error('Excepción no capturada:', err); process.exit(1); });
-
-async function convertCurrency(amount, fromCurrency, toCurrency, apiDate, rate = undefined) {
-    if (fromCurrency.toLowerCase() === toCurrency.toLowerCase()) return parseFloat(amount.toFixed(2));
-    if (rate !== undefined) return parseFloat((amount * rate).toFixed(2));
-    const apiUrl = 'https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@' + apiDate + '/v1/currencies/' + fromCurrency.toLowerCase() + '.json';
+// Webhook endpoint
+App.post('/webhook', (req, res) => {
     try {
-        const response = await axios.get(apiUrl);
-        const rates = response.data[fromCurrency.toLowerCase()];
-        if (!rates || !rates[toCurrency.toLowerCase()]) throw new Error('Tasa no encontrada para ' + fromCurrency + ' a ' + toCurrency);
-        return parseFloat((amount * rates[toCurrency.toLowerCase()]).toFixed(2));
+        Bot.handleUpdate(req.body);
+        res.sendStatus(200);
     } catch (error) {
-        logger.error('Error al convertir moneda:', error);
-        throw new Error('No se pudo convertir la moneda');
+        logger.error('Error al manejar actualización:', error);
+        res.sendStatus(500);
     }
-}
+});
 
-module.exports = {
-    InitApp, InitBot, LaunchBot, InitActualManager, convertCurrency, helpers, logger, VERBOSITY, INPUT_API_USER,
-    config: {
-        LOG_LEVEL, PORT, USER_IDS, BOT_VERBOSITY, INPUT_API_KEY, INTRO_DEFAULT, INTRO,
-        ACTUAL_CURRENCY, ACTUAL_DEFAULT_ACCOUNT, ACTUAL_DEFAULT_ACCOUNT_DANI, ACTUAL_DEFAULT_CATEGORY,
-        ACTUAL_NOTE_PREFIX, ACTUAL_BALANCE_ACCOUNT, ACTUAL_USER_RENE, ACTUAL_USER_DANI, ACTUAL_SYNC_ID_2,
-        OPENAI_API_KEY, OPENAI_API_ENDPOINT, OPENAI_MODEL, OPENAI_TEMPERATURE, OPENAI_PROMPT, OPENAI_RULES
-    },
-};
+// Custom input endpoint
+App.post('/input', (req, res) => {
+    try {
+        const apiKey = req.headers['x-api-key'];
+        if (!apiKey || apiKey !== config.INPUT_API_KEY || !config.INPUT_API_KEY || config.INPUT_API_KEY.length < 16) {
+            return res.status(401).send('Unauthorized');
+        }
+        const { user_id, text } = req.body;
+        if (config.USER_IDS.includes(user_id)) {
+            Bot.handleUpdate(helpers.createUpdateObject(user_id, INPUT_API_USER, text));
+            return res.json({ status: 'OK' });
+        } else {
+            return res.status(403).send('Forbidden');
+        }
+    } catch (error) {
+        logger.error('Error al manejar input personalizado. ', error);
+        return res.status(500).json({ error: 'Error al procesar el mensaje' });
+    }
+});
+
+// Health check
+App.get('/health', (req, res) => res.send('OK'));
