@@ -73,13 +73,10 @@ if (!USE_POLLING) {
 const PORT = parseInt(process.env.PORT, 10) || 5007;
 
 // Intro texts
-const INTRO_DEFAULT = `This is a private bot that helps with adding transactions to Actual Budget by using ChatGPT or other LLMs.
+const INTRO_DEFAULT = `Este es nuestro robot para registrar nuestros gastos de ActualBudget usando AI
 
-You can set up your own instance, more info here:
-https://github.com/deseven/telegram-actual-llm-helper
-
-Your User ID is %USER_ID%.`;
-const INTRO = `Hello! Send me any information about a transaction and I'll try to process it!`;
+Tu user ID es: %USER_ID%.`;
+const INTRO = `Hola, dame información sobre alguna transacción e intentaré procesarla.`;
 
 // Actual
 const ACTUAL_API_ENDPOINT = process.env.ACTUAL_API_ENDPOINT;
